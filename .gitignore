@@ -1,5 +1,5 @@
 *.DS_Store
-
+.vscode/
 *__pycache__
 *.ipynb_checkpoints/
 ._*.py
@@ -16,4 +16,4 @@ results*/
 *.dict
 datasets/acopf/acopf118_dataset
 datasets/acopf/matlab_datasets/FeasiblePairs_Case118.mat
-datasets/*
+datasets/simple/random_simple*

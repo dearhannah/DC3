@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: sanity-rl-on0andoff10-data-small-actions-long-train
+  name: sanity-rlwcomp-01
 spec:
   restartPolicy: Never 
   securityContext:
@@ -25,7 +25,8 @@ spec:
           cd /workspace/research/DC3
           echo "Running from $(pwd)"
           #python
-          python method_4.py --useSanity=True --useWandb=True
+          # python method_5.py --useSanity=True --useWandb=True --useCompl=True --alpha=1.0 --beta=0.0
+          python method_5.py --useSanity=True --useWandb=True --useCompl=True --alpha=0.0 --beta=1.0
       resources:
         limits:
           memory: "40Gi"

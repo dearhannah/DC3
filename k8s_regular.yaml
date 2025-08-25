@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: regular-rlwdata-as-corr-dc3-schedule-std-neg5-2
+  name: bench-10000
 spec:
   restartPolicy: Never 
   securityContext:
@@ -25,7 +25,7 @@ spec:
           cd /workspace/research/DC3
           echo "Running from $(pwd)"
           #python
-          python method_4.py --useSanity=False --useWandb=True
+          python linear_solver_benchmark.py
       resources:
         limits:
           memory: "40Gi"

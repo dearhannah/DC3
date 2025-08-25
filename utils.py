@@ -1353,14 +1353,14 @@ class SimpleProblemMultiParam:
         resids = self.ineq_resid(X, Y)
         return torch.clamp(resids, min=0)
     
-    # Solves for the full set of variables
-    def complete_partial(self, X, Z):
-        Y = torch.zeros(X.shape[0], self.ydim, device=self.device)
-        Y[:, self.partial_vars] = Z
-        self._A_partial = self._A[:, self._partial_vars]
-        self._A_other_inv = torch.inverse(self._A[:, self._other_vars])
-        Y[:, self.other_vars] = (X - Z @ self._A_partial.T) @ self._A_other_inv.T
-        return Y
+    # # Solves for the full set of variables
+    # def complete_partial(self, X, Z):
+    #     Y = torch.zeros(X.shape[0], self.ydim, device=self.device)
+    #     Y[:, self.partial_vars] = Z
+    #     self._A_partial = self._A[:, self._partial_vars]
+    #     self._A_other_inv = torch.inverse(self._A[:, self._other_vars])
+    #     Y[:, self.other_vars] = (X - Z @ self._A_partial.T) @ self._A_other_inv.T
+    #     return Y
 
     def complete_partial(self, X, Z):
         """
@@ -1387,6 +1387,37 @@ class SimpleProblemMultiParam:
                 A_other_inv = torch.pinverse(A_other)
             # Y[i, pv] = Z_i
             Y[i, ov] = torch.matmul((X_i - torch.matmul(Z_i, A_partial.T)), A_other_inv.T)
+        return Y
+    
+    def complete_partial_parallel(self, X, Z):
+        """
+        Given a batch of X (concatenated input) and Z (partial variables),
+        complete the full Y for each sample in the batch using the equality constraints.
+        This is a truly parallelized version using batch operations with torch.linalg.solve.
+        Returns Y of shape (batch_size, ydim).
+        """
+        A = self.A(X)  # (B, neq, ydim)
+        X_true = self.X(X)  # (B, neq)
+        Y = torch.zeros(X.shape[0], self.ydim, device=self.device)
+        pv = self.partial_vars
+        ov = self.other_vars
+        # Set the partial variables (this is already correct)
+        Y[:, pv] = Z
+        # Extract the relevant submatrices for all samples at once
+        A_partial = A[:, :, pv]  # (B, neq, len(pv))
+        A_other = A[:, :, ov]    # (B, neq, len(ov))
+        # Compute the right-hand side: X_true - A_partial @ Z, A_partial @ Z has shape (B, neq)
+        rhs = X_true - torch.bmm(A_partial, Z.unsqueeze(-1)).squeeze(-1)  # (B, neq)
+        # Solve the linear system: A_other @ y_other = rhs
+        try:
+            # Use batch solve: A_other is (B, neq, len(ov)), rhs is (B, neq)
+            y_other = torch.linalg.solve(A_other, rhs.unsqueeze(-1)).squeeze(-1)  # (B, len(ov))
+        except torch.linalg.LinAlgError:
+            # Fall back to least squares solution if system is singular
+            y_other = torch.linalg.lstsq(A_other, rhs.unsqueeze(-1)).solution.squeeze(-1)
+        # Set the computed variables
+        Y[:, ov] = y_other
+        
         return Y
         
     def __str__(self):

@@ -20,13 +20,24 @@ def loss_w_soft_penalty(data, X, Y, args):
 
 class GaussianPolicy(nn.Module):
     """Gaussian Policy for continuous action space"""
-    def __init__(self, state_dim, action_dim, hidden_dim=200):
+    def __init__(self, data, args, hidden_dim=200):
         super().__init__()
-        self.state_dim = state_dim
-        self.action_dim = action_dim
+        self._data = data
+        self._args = args
+        self.partial_action_dim = data.ydim - data.neq
+        
+        # Input dimension: state_dim (x + y)
+        self.state_dim = data.xdim + data.ydim
+        
+        # Output dimension: partial variables only
+        if args['useCompl']:
+            self.action_dim = data.ydim - data.neq  # Partial variables only
+        else:
+            self.action_dim = data.ydim  # Full variables
+        
         # Shared feature extractor
         self.feature_net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
+            nn.Linear(self.state_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
             nn.Dropout(p=0.2),
@@ -36,8 +47,9 @@ class GaussianPolicy(nn.Module):
             nn.Dropout(p=0.2)
         )
         # Policy heads for mean and log_std
-        self.mean_head = nn.Linear(hidden_dim, action_dim)
-        self.log_std_head = nn.Linear(hidden_dim, action_dim)
+        self.mean_head = nn.Linear(hidden_dim, self.action_dim)
+        self.log_std_head = nn.Linear(hidden_dim, self.action_dim)
+        
         # Initialize weights
         for layer in self.feature_net:
             if isinstance(layer, nn.Linear):
@@ -48,33 +60,47 @@ class GaussianPolicy(nn.Module):
         self.log_std_head.bias.data.fill_(-2.0)
     
     def forward(self, s):
-        """Forward pass to get action parameters"""
+        """
+        Forward pass to get action parameters
+        Args:
+            s: state tensor of shape (batch_size, state_dim) - concatenated [x, y]
+        Returns:
+            mu: mean of action distribution (partial actions)
+            log_std: log standard deviation of action distribution (partial actions)
+        """
         features = self.feature_net(s)
         mu = self.mean_head(features)
         log_std = self.log_std_head(features)
         # Clamp log_std for numerical stability
         log_std = torch.clamp(log_std, -5.0, 2.0)  # std ∈ [0.0067, 7.4]
-        # log_std = torch.clamp(log_std, -0.9, 2)  # std ∈ [0.4, 7.4]
         return mu, log_std
     
     def sample_action(self, s):
-        """Sample action from policy"""
+        """
+        Sample action from policy
+        Args:
+            s: state tensor of shape (batch_size, state_dim) - concatenated [x, y]
+        Returns:
+            action: action tensor of shape (batch_size, action_dim)
+        """
         mu, log_std = self.forward(s)
         std = torch.exp(log_std)
         # Create normal distribution
         normal = Normal(mu, std)
         # Sample action
         action = normal.rsample()  # Use rsample for reparameterization trick
-        # # Compute log probability BEFORE clamping
-        # log_prob = normal.log_prob(action)
-        # # Sum log probabilities across action dimensions
-        # log_prob = log_prob.sum(dim=-1)
-        # Clamp action to [-1, 1]
-        action = torch.clamp(action, -1, 1)
-        return action#, log_prob
+        action = torch.clamp(action, -0.3, 0.2)
+        return action
     
     def get_log_prob(self, s, a):
-        """Get log probability of action given state"""
+        """
+        Get log probability of action given state
+        Args:
+            s: state tensor of shape (batch_size, state_dim)
+            a: action tensor of shape (batch_size, action_dim)
+        Returns:
+            log_prob: log probability of the action
+        """
         mu, log_std = self.forward(s)
         std = torch.exp(log_std)
         normal = Normal(mu, std)
@@ -83,28 +109,56 @@ class GaussianPolicy(nn.Module):
         log_prob = log_prob.sum(dim=-1)
         return log_prob
 
-def Q_s_a(data, s, a, args):
-    """Compute negative Q-value (to be maximized) for state-action pairs"""
+    def state_transition(self, x, y_current, action):
+        """
+        state transition function for RL
+        Args:
+            x: 输入 (batch_size, xdim)
+            y_current: 当前Y (batch_size, ydim) 
+            action: 部分action (batch_size, action_dim)
+        Returns:
+            y_new: 新的完整Y (batch_size, ydim)
+        """
+        if self._args['useCompl']:
+            y_new_partial = y_current[:, :self.partial_action_dim] + action
+            y_new = self._data.complete_partial_parallel(x, y_new_partial)
+        else:
+            y_new = y_current + action
+        return y_new
+
+def Q_s_a(policy, data, s, a, args):
+    """
+    Compute negative Q-value (to be maximized) for state-action pairs
+    Args:
+        policy: GaussianPolicy object
+        data: Dataset object
+        s: state tensor of shape (batch_size, x_dim + y_dim)
+        a: partial action tensor of shape (batch_size, action_dim)
+        args: Arguments
+    """
     x_dim = data.xdim
     x = s[:, :x_dim]
-    y = s[:, x_dim:]
-    y_new = y + a
+    y_current = s[:, x_dim:]
+    
+    # Use policy's state_transition to get new Y
+    y_new = policy.state_transition(x, y_current, a)
+    
     q_s_a = loss_w_soft_penalty(data, x, y_new, args)
     return q_s_a
 
-def compute_advantage_simple(data, s, a, args):
-    """Simple advantage estimation based on loss improvement (Option B)"""
-    # Split state back to x and y
-    x_dim = data.xdim
-    x = s[:, :x_dim]
-    y = s[:, x_dim:]
-    # Apply action (update)
-    y_new = y + a
-    # Compute advantage as negative loss difference
-    loss_old = loss_w_soft_penalty(data, x, y, args)
-    loss_new = loss_w_soft_penalty(data, x, y_new, args)
-    advantage = -(loss_new - loss_old)  # Negative because we want to minimize loss
-    return advantage
+# def compute_advantage_simple(data, s, a, args):
+#     """Simple advantage estimation based on loss improvement (Option B)"""
+#     # Split state back to x and y
+#     x_dim = data.xdim
+#     x = s[:, :x_dim]
+#     y = s[:, x_dim:]
+#     # Apply action (update)
+#     y_new = y + a
+#     # Compute advantage as negative loss difference
+#     loss_old = loss_w_soft_penalty(data, x, y, args)
+#     loss_new = loss_w_soft_penalty(data, x, y_new, args)
+#     advantage = -(loss_new - loss_old)  # Negative because we want to minimize loss
+#     return advantage
 
 def trajectory_sampler(start_point, end_point, data, batch, args, n_trajectory_per_data=1):
     """
@@ -327,7 +381,7 @@ def hybrid_policy_loss(policy, data, states, actions, args, alpha=0.7, beta=0.3,
         policy: GaussianPolicy
         data: Dataset object
         states: tensor of shape (batch_size, state_dim)
-        actions: tensor of shape (batch_size, action_dim) - trajectory actions
+        actions: tensor of shape (batch_size, action_dim) - partial trajectory actions
         args: Arguments for loss computation
         alpha: Weight for BC loss
         beta: Weight for Q-learning loss
@@ -338,25 +392,17 @@ def hybrid_policy_loss(policy, data, states, actions, args, alpha=0.7, beta=0.3,
         bc_loss: Behavioral cloning loss (MSE)
         ql_loss: Q-learning loss
     """
-    batch_size = states.shape[0]
+    # batch_size = states.shape[0]
     
-    # Sample actions from policy
-    # sampled_actions, sampled_log_probs = policy.sample_action(states)  # Shape: (batch_size, action_dim)
-    sampled_actions = policy.sample_action(states)  # Shape: (batch_size, action_dim)
+    # Sample partial actions from policy
+    sampled_partial_actions = policy.sample_action(states)  # Shape: (batch_size, action_dim)
     
-    # Behavioral Cloning Loss: L_BC = MSE(sampled_actions, trajectory_actions)
-    bc_loss = F.mse_loss(sampled_actions, actions)
+    # Behavioral Cloning Loss: L_BC = MSE(sampled_partial_actions, trajectory_partial_actions)
+    bc_loss = F.mse_loss(sampled_partial_actions, actions[:, :policy.action_dim])
     
-    # # Q-learning Loss: L_QL = -exp(A(s,a)/λ) * log π(a|s)
-    # # Compute advantages for sampled actions
-    # advantages = compute_advantage_simple(data, states, sampled_actions, args)  # Shape: (batch_size,)
-    
-    # Q-learning loss: minimize negative Q-values
-    ql_loss_raw = Q_s_a(data, states, sampled_actions, args).mean()
-    # Clip ql_loss for stability
-    # ql_loss = torch.clamp(ql_loss_raw, 0, 10.0)  # Clip between 0 and 10
+    # Q-learning loss: minimize negative Q-values using partial actions
+    ql_loss_raw = Q_s_a(policy, data, states, sampled_partial_actions, args).mean()
     ql_loss = ql_loss_raw/100.0
-    
     
     # Combine losses
     total_loss = alpha * bc_loss + beta * ql_loss

@@ -80,7 +80,7 @@ def main():
     # RL-specific arguments
     parser.add_argument('--rlLr', type=float, default=1e-4, help='learning rate for RL policy network')
     parser.add_argument('--episodeLength', type=int, default=5, help='number of steps per RL episode')
-    parser.add_argument('--rlThreshold', type=float, default=0.0, help='threshold for constraint violations to start RL training')
+    parser.add_argument('--rlThreshold', type=float, default=1.0, help='threshold for constraint violations to start RL training')
     parser.add_argument('--alpha', type=float, default=0.7, help='weight for BC loss in hybrid policy loss')
     parser.add_argument('--beta', type=float, default=0.3, help='weight for RA loss in hybrid policy loss')
     parser.add_argument('--lambda_temp', type=float, default=1.0, help='temperature parameter for RA loss')
@@ -107,7 +107,7 @@ def main():
         if run_name is None:
                           # Auto-generate run name based on experiment type
               if args.get('useSanity', False):
-                  run_name = f"sanity-rl-small-actions-long--seperate-train-{args['probType']}-{time_str}"
+                  run_name = f"sanity-rlwcomp-small-actions-long-train-{args['probType']}-{time_str}"
               else:
                   run_name = f"regular-rl-on&off-data-schedule-std-neg5-2-ascorr-{args['probType']}-{time_str}"
         wandb.init(
@@ -153,7 +153,6 @@ def main():
                 pass
     data._device = DEVICE
 
-    # Add sanity indicator to save directory
     sanity_suffix = '_sanity' if args.get('useSanity', False) else '_regular'
     save_dir = os.path.join('results', str(data), 'method', my_hash(str(sorted(list(args.items())))),
         time_str + sanity_suffix)
@@ -181,9 +180,7 @@ def train_net(data, args, save_dir):
 
     # Initialize networks and policy network
     initializer_net = NNSolver(data, args)  # Network 1: Initializer (supervised)
-    state_dim = data.xdim + data.ydim  # [x, y] concatenated
-    action_dim = data.ydim  # Δy dimension
-    policy_net = GaussianPolicy(state_dim, action_dim, hidden_dim=args['hiddenSize'])
+    policy_net = GaussianPolicy(data, args, hidden_dim=args['hiddenSize'])
     
     initializer_net.to(DEVICE)
     policy_net.to(DEVICE)
@@ -192,7 +189,7 @@ def train_net(data, args, save_dir):
     initializer_opt = optim.Adam(initializer_net.parameters(), lr=args['lr'])
     policy_opt = optim.Adam(policy_net.parameters(), lr=args['rlLr'])
     
-    # Initialize RL flag, buffer and on-policy buffer
+    # Initialize flag and buffer
     rl_enabled = False
     initial_model_good = False  # Flag to track if initial model is performing well enough
     buffer = []
@@ -218,11 +215,11 @@ def train_net(data, args, save_dir):
         epoch_stats = {}
         # Get valid loss for initializer
         initializer_net.eval()
+        policy_net.eval()
         for Xvalid in valid_loader:
             Xvalid = Xvalid[0].to(DEVICE)
             eval_net(data, Xvalid, initializer_net, args, 'valid', epoch_stats, policy_net, rl_enabled)
         # Get test loss for initializer
-        initializer_net.eval()
         for Xtest in test_loader:
             Xtest = Xtest[0].to(DEVICE)
             eval_net(data, Xtest, initializer_net, args, 'test', epoch_stats, policy_net, rl_enabled)
@@ -549,17 +546,17 @@ def eval_net(data, X, solver_net, args, prefix, stats, policy_net=None, rl_enabl
 
     # Check if RL training has started and apply policy to improve solution
     if policy_net is not None and rl_enabled:
+        start_time = time.time()
         # Apply policy to improve the solution
         Y_current = Y_initial.clone()
         for step in range(args['episodeLength']):
             with torch.no_grad():
                 # Create state by concatenating X and Y_current
                 state = torch.cat([X, Y_current], dim=1)
-                # Sample action from policy
-                # action, _ = policy_net.sample_action(state)
-                action = policy_net.sample_action(state)
-                # Apply action to update Y
-                Y_current = Y_current + action
+                # Sample partial action from policy
+                partial_action = policy_net.sample_action(state)
+                # Apply action to update Y using policy's state_transition
+                Y_current = policy_net.state_transition(X, Y_current, partial_action)
         Y = Y_current  # Use the improved Y from policy steps
         end_time = time.time()
 
@@ -633,9 +630,12 @@ class NNSolver(nn.Module):
         if self._args['useCompl']:
             if 'acopf' in self._args['probType']:
                 out = nn.Sigmoid()(out)   # used to interpolate between max and min values
-            return self._data.complete_partial(x, out)
+            out_full = self._data.complete_partial_parallel(x, out)
+            # return self._data.complete_partial_parallel(x, out)
         else:
-            return self._data.process_output(x, out)
+            out_full = out
+
+        return out_full
 
 
 if __name__=='__main__':
