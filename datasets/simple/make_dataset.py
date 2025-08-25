@@ -17,7 +17,6 @@ num_ineq = 50
 num_eq = 50
 num_examples = 10000
 
-
 num_ineq = 50
 for num_eq in [10, 30, 50, 70, 90]:
     print(num_ineq, num_eq)
@@ -36,20 +35,39 @@ for num_eq in [10, 30, 50, 70, 90]:
     with open("./random_simple_dataset_var{}_ineq{}_eq{}_ex{}".format(num_var, num_ineq, num_eq, num_examples), 'wb') as f:
         pickle.dump(problem, f)
 
-num_eq = 50
-for num_ineq in [10, 30, 70, 90]:
-    print(num_ineq, num_eq)
-    np.random.seed(17)
-    Q = np.diag(np.random.random(num_var))
-    p = np.random.random(num_var)
-    A = np.random.normal(loc=0, scale=1., size=(num_eq, num_var))
-    X = np.random.uniform(-1, 1, size=(num_examples, num_eq))
-    G = np.random.normal(loc=0, scale=1., size=(num_ineq, num_var))
-    h = np.sum(np.abs(G@np.linalg.pinv(A)), axis=1)
 
-    problem = SimpleProblem(Q, p, A, G, h, X)
-    problem.calc_Y()
-    print(len(problem.Y))
+# num_ineq = 50
+# for num_eq in [10, 30, 50, 70, 90]:
+#     print(num_ineq, num_eq)
+#     np.random.seed(17)
+#     Q = np.diag(np.random.random(num_var))
+#     p = np.random.random(num_var)
+#     A = np.random.normal(loc=0, scale=1., size=(num_eq, num_var))
+#     X = np.random.uniform(-1, 1, size=(num_examples, num_eq))
+#     G = np.random.normal(loc=0, scale=1., size=(num_ineq, num_var))
+#     h = np.sum(np.abs(G@np.linalg.pinv(A)), axis=1)
 
-    with open("./random_simple_dataset_var{}_ineq{}_eq{}_ex{}".format(num_var, num_ineq, num_eq, num_examples), 'wb') as f:
-        pickle.dump(problem, f)
+#     problem = SimpleProblem(Q, p, A, G, h, X)
+#     problem.calc_Y()
+#     print(len(problem.Y))
+
+#     with open("./random_simple_dataset_var{}_ineq{}_eq{}_ex{}".format(num_var, num_ineq, num_eq, num_examples), 'wb') as f:
+#         pickle.dump(problem, f)
+
+# num_eq = 50
+# for num_ineq in [10, 30, 70, 90]:
+#     print(num_ineq, num_eq)
+#     np.random.seed(17)
+#     Q = np.diag(np.random.random(num_var))
+#     p = np.random.random(num_var)
+#     A = np.random.normal(loc=0, scale=1., size=(num_eq, num_var))
+#     X = np.random.uniform(-1, 1, size=(num_examples, num_eq))
+#     G = np.random.normal(loc=0, scale=1., size=(num_ineq, num_var))
+#     h = np.sum(np.abs(G@np.linalg.pinv(A)), axis=1)
+
+#     problem = SimpleProblem(Q, p, A, G, h, X)
+#     problem.calc_Y()
+#     print(len(problem.Y))
+
+#     with open("./random_simple_dataset_var{}_ineq{}_eq{}_ex{}".format(num_var, num_ineq, num_eq, num_examples), 'wb') as f:
+#         pickle.dump(problem, f)

@@ -10,7 +10,10 @@
 *.iml
 
 *.m~
-
+wandb/
 results/
+results*/
+*.dict
 datasets/acopf/acopf118_dataset
 datasets/acopf/matlab_datasets/FeasiblePairs_Case118.mat
+datasets/*

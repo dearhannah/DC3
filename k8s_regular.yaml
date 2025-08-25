@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: regular-rlwdata-as-corr-dc3-schedule-std-neg5-2
+spec:
+  restartPolicy: Never 
+  securityContext:
+    runAsUser: 272115
+    runAsGroup: 1132
+  containers:
+    - name: simplenotebook
+      # image: quay.io/jupyter/minimal-notebook:latest
+      image: pytorch/pytorch:1.7.1-cuda11.0-cudnn8-devel
+      volumeMounts: 
+        # - name: d10
+        #   mountPath: /sciclone/data10/hmeng
+        - name: nsf
+          mountPath: /workspace
+      command: 
+        - /bin/bash
+        - -c
+        - |
+          eval "$(conda shell.bash hook)"
+          conda activate /workspace/.conda/envs/diffusionRL
+          cd /workspace/research/DC3
+          echo "Running from $(pwd)"
+          #python
+          python method_4.py --useSanity=False --useWandb=True
+      resources:
+        limits:
+          memory: "40Gi"
+          cpu: 12
+          nvidia.com/gpu: 1
+      # securityContext:
+      #   runAsUser: 272115
+      #   runAsGroup: 1132
+  nodeSelector:
+    nvidia.com/gpu.product: "NVIDIA-A40"
+    # owner: hchen
+    #kubernetes.io/hostname: gu07.sciclone.wm.edu
+  volumes:
+    - name: nsf
+      nfs:
+        server: 128.239.56.166
+        path: /sciclone/home/hmeng/
+    # - name: d10
+    #   nfs:
+    #     server: 128.239.56.30
+    #     path: /sciclone/data10/hmeng
+
+
+ 
+ 

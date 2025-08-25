@@ -32,7 +32,7 @@ def baseline_nn_default_args(prob_type):
     defaults['resultsSaveFreq'] = 50
 
     if prob_type == 'simple':
-        defaults['epochs'] = 1000
+        defaults['epochs'] = 2000
         defaults['batchSize'] = 200
         defaults['lr'] = 1e-4
         defaults['hiddenSize'] = 200
@@ -140,15 +140,15 @@ def method_default_args(prob_type):
     defaults['resultsSaveFreq'] = 50
 
     if prob_type == 'simple':
-        defaults['epochs'] = 1000
+        defaults['epochs'] = 2000
         defaults['batchSize'] = 200
         defaults['lr'] = 1e-4
         defaults['hiddenSize'] = 200
         defaults['softWeight'] = 10          # use 100 if useCompl=False
         defaults['softWeightEqFrac'] = 0.5
         defaults['useCompl'] = True
-        defaults['useTrainCorr'] = True
-        defaults['useTestCorr'] = True
+        defaults['useTrainCorr'] = False
+        defaults['useTestCorr'] = False
         defaults['corrMode'] = 'partial'    # use 'full' if useCompl=False
         defaults['corrTrainSteps'] = 10
         defaults['corrTestMaxSteps'] = 10
