@@ -244,6 +244,90 @@ def trajectory_sampler(start_point, end_point, data, batch, args, n_trajectory_p
     
     return states, actions
 
+def trajectory_sampler_every_step(start_point, end_point, data, batch, args, n_trajectory_per_data=1):
+    """
+    Generate multiple trajectory data in (s, a) format.
+    Args:
+        start_point: tensor of shape (batch_size, ydim) - model output (y_0)
+        end_point: tensor of shape (batch_size, ydim) - saved answer (y_1)
+        data: Dataset object
+        batch: Input batch for loss computation
+        args: Arguments for loss computation
+        n_steps: number of steps to sample between start and end
+        n_trajectory_per_data: number of trajectories per data point
+    Returns:
+        trajectory_states: tensor of shape (batch_size * n_trajectory_per_data, n_steps, xdim + ydim) - concatenated [x, y] with preserved step dimension
+        trajectory_actions: tensor of shape (batch_size * n_trajectory_per_data, n_steps, ydim) - action (delta_y) with preserved step dimension
+    """
+    n_steps = args['episodeLength']
+    batch_size = start_point.shape[0]
+    x_dim = data.xdim
+    y_dim = data.ydim
+    
+    # Calculate total distance from start to end
+    total_distance = end_point - start_point  # Shape: (batch_size, ydim)
+    
+    # Total number of trajectories
+    total_trajectories = batch_size * n_trajectory_per_data
+    
+    # Batch sample random step lengths for all trajectories at once
+    # Shape: (total_trajectories, n_steps, y_dim)
+    step_lengths_raw = torch.rand(total_trajectories, n_steps, y_dim, device=start_point.device)
+    
+    # Normalize step lengths so they sum to total distance for each trajectory and dimension
+    # Shape: (total_trajectories, n_steps, y_dim)
+    step_lengths = step_lengths_raw / step_lengths_raw.sum(dim=1, keepdim=True)  # Normalize to sum to 1
+    
+    # Sort step lengths along the steps dimension (dim=1) in descending order
+    # This ensures larger steps come first (early in trajectory) and smaller steps come later (near target)
+    step_lengths_sorted, _ = torch.sort(step_lengths, dim=1, descending=True)
+    
+    # Expand total_distance to match trajectory dimensions
+    # Shape: (batch_size, 1, y_dim) -> (total_trajectories, 1, y_dim)
+    total_distance_expanded = total_distance.unsqueeze(1).repeat(1, n_trajectory_per_data, 1)
+    total_distance_expanded = total_distance_expanded.view(total_trajectories, 1, y_dim)
+    
+    # Scale step lengths by total distance
+    # step_lengths = step_lengths * total_distance_expanded  # Shape: (total_trajectories, n_steps, y_dim)
+    step_lengths = step_lengths_sorted * total_distance_expanded  # Shape: (total_trajectories, n_steps, y_dim)
+
+    # Compute actions (step lengths) and clamp them first
+    # Shape: (total_trajectories, n_steps, y_dim)
+    actions = step_lengths.clone()
+    # Clamp actions to [-1, 1]
+    actions = torch.clamp(actions, -0.3, 0.2)
+    
+    # Expand start points to match trajectory dimensions
+    # Shape: (batch_size, y_dim) -> (total_trajectories, y_dim)
+    start_points_expanded = start_point.repeat(1, n_trajectory_per_data).view(total_trajectories, y_dim)
+    
+    # Compute trajectory positions step by step using clamped actions
+    # Shape: (total_trajectories, n_steps, y_dim)
+    trajectory_positions = torch.zeros(total_trajectories, n_steps, y_dim, device=start_point.device)
+    
+    # First position is the start point
+    trajectory_positions[:, 0, :] = start_points_expanded
+    
+    # Compute subsequent positions by adding clamped actions
+    for step_idx in range(1, n_steps):
+        trajectory_positions[:, step_idx, :] = trajectory_positions[:, step_idx-1, :] + actions[:, step_idx-1, :]
+    
+    # Expand batch data to match trajectory dimensions
+    # Shape: (batch_size, x_dim) -> (total_trajectories, x_dim)
+    batch_expanded = batch.repeat(1, n_trajectory_per_data).view(total_trajectories, x_dim)
+    
+    # Prepare output with preserved step dimensions
+    # Shape: (total_trajectories, n_steps, x_dim + y_dim)
+    trajectory_states = torch.cat([
+        batch_expanded.unsqueeze(1).expand(-1, n_steps, -1),  # (total_trajectories, n_steps, x_dim)
+        trajectory_positions  # (total_trajectories, n_steps, y_dim)
+    ], dim=2)
+    
+    # Shape: (total_trajectories, n_steps, y_dim)
+    trajectory_actions = actions
+    
+    return trajectory_states, trajectory_actions
+
 def on_policy_trajectory_collector(start_point, policy_net, data, batch, args, n_trajectory_per_data=1):
     """
     Generate on-policy trajectory data using the current policy network.
