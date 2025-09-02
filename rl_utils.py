@@ -295,7 +295,7 @@ def trajectory_sampler_every_step(start_point, end_point, data, batch, args, n_t
     # Shape: (total_trajectories, n_steps, y_dim)
     actions = step_lengths.clone()
     # Clamp actions to [-1, 1]
-    actions = torch.clamp(actions, -0.3, 0.2)
+    # actions = torch.clamp(actions, -0.3, 0.2)
     
     # Expand start points to match trajectory dimensions
     # Shape: (batch_size, y_dim) -> (total_trajectories, y_dim)

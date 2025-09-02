@@ -18,7 +18,10 @@ import os
 import argparse
 from utils import my_hash, str_to_bool
 import default_args
-from rl_utils import GaussianPolicy, trajectory_sampler, train_policy_step, evaluate_policy, compute_bc_ql_schedule, on_policy_trajectory_collector
+# RL utilities not needed for diffusion approach
+# from rl_utils import GaussianPolicy, trajectory_sampler, train_policy_step, evaluate_policy, compute_bc_ql_schedule, on_policy_trajectory_collector
+from agents.diffusion import Diffusion
+from agents.model import MLP
 import psutil  # For memory monitoring
 PSUTIL_AVAILABLE = True
 import wandb
@@ -81,7 +84,7 @@ def main():
     parser.add_argument('--rlLr', type=float, default=1e-4, help='learning rate for RL policy network')
     parser.add_argument('--episodeLength', type=int, default=5, help='number of steps per RL episode')
     parser.add_argument('--rlThreshold', type=float, default=1.0, help='threshold for constraint violations to start RL training')
-    parser.add_argument('--alpha', type=float, default=0.7, help='weight for BC loss in hybrid policy loss')
+    parser.add_argument('--alpha', type=float, default=0.0, help='weight for BC loss in hybrid policy loss')
     parser.add_argument('--beta', type=float, default=0.3, help='weight for RA loss in hybrid policy loss')
     parser.add_argument('--lambda_temp', type=float, default=1.0, help='temperature parameter for RA loss')
     parser.add_argument('--policySteps', type=int, default=5, help='number of policy update steps per epoch')
@@ -92,6 +95,17 @@ def main():
     parser.add_argument('--scheduleBCTransition', type=int, default=300, help='number of epochs to transition from BC-only to final BC/QL ratio')
     # On-policy trajectory arguments
     parser.add_argument('--onPolicyRatio', type=float, default=0.0, help='ratio of on-policy data in training batch (0.0=off-policy only, 1.0=on-policy only)')
+    
+    # Diffusion-specific arguments
+    parser.add_argument('--max_noise', type=float, default=3.0, help='maximum noise level for diffusion process')
+    parser.add_argument('--diffusion_beta_start', type=float, default=0.1, help='starting beta value for diffusion noise schedule')
+    parser.add_argument('--diffusion_beta_end', type=float, default=0.5, help='ending beta value for diffusion noise schedule')
+    parser.add_argument('--n_timesteps', type=int, default=5, help='number of diffusion timesteps')
+    parser.add_argument('--beta_schedule', type=str, default='linear', choices=['linear', 'cosine', 'vp'], help='diffusion beta schedule type')
+    parser.add_argument('--loss_type', type=str, default='l2', help='diffusion loss type')
+    parser.add_argument('--clip_denoised', type=str_to_bool, default=False, help='whether to clip denoised values')
+    parser.add_argument('--predict_epsilon', type=str_to_bool, default=True, help='whether to predict epsilon or x0 directly')
+    
     args = parser.parse_args()
     args = vars(args) # change to dictionary
     defaults = default_args.method_default_args(args['probType'])
@@ -107,7 +121,7 @@ def main():
         if run_name is None:
                           # Auto-generate run name based on experiment type
               if args.get('useSanity', False):
-                  run_name = f"sanity-rlwcomp-small-actions-long-train-{args['probType']}-{time_str}"
+                  run_name = f"sanity-diffusion-bc-{args['probType']}-{time_str}"
               else:
                   run_name = f"regular-rl-on&off-data-schedule-std-neg5-2-ascorr-{args['probType']}-{time_str}"
         wandb.init(
@@ -179,33 +193,17 @@ def train_net(data, args, save_dir):
     test_loader = DataLoader(test_dataset, batch_size=len(test_dataset))
 
     # Initialize networks and policy network
-    initializer_net = NNSolver(data, args)  # Network 1: Initializer (supervised)
-    policy_net = GaussianPolicy(data, args, hidden_dim=args['hiddenSize'])
-    
-    initializer_net.to(DEVICE)
-    policy_net.to(DEVICE)
-    
+    initializer_net = NNSolver(data, args).to(DEVICE)  # Network 1: Initializer (supervised)
+    model = MLP(data, args, device=DEVICE)
+    diffusion_net = Diffusion(data, model=model, args=args).to(DEVICE)
+
     # Optimizers
     initializer_opt = optim.Adam(initializer_net.parameters(), lr=args['lr'])
-    policy_opt = optim.Adam(policy_net.parameters(), lr=args['rlLr'])
+    diffusion_opt = optim.Adam(diffusion_net.parameters(), lr=args['rlLr'])
     
-    # Initialize flag and buffer
+    # Initialize flags
     rl_enabled = False
     initial_model_good = False  # Flag to track if initial model is performing well enough
-    buffer = []
-    buffer_size_limit = args['bufferSize']
-    buffer_strategy = args.get('bufferStrategy', 'fifo')
-    on_policy_buffer = []
-    on_policy_buffer_size_limit = args['bufferSize']
-    on_policy_ratio = args.get('onPolicyRatio', 0.5)
-    # Print buffer information
-    print(f"Using buffers with max size {buffer_size_limit}, strategy: {buffer_strategy}")
-    print(f"On-policy ratio: {on_policy_ratio:.2f}")
-    if buffer_strategy == 'fifo':
-        print("FIFO strategy: removes oldest data first (more memory efficient)")
-    else:
-        print("Random strategy: keeps random subset of data (may cause memory leaks)")
-    
     # Track memory usage for leak detection
     initial_memory = get_memory_usage() if PSUTIL_AVAILABLE else 0
     print(f"Initial memory usage: {initial_memory:.2f} GB")
@@ -215,14 +213,14 @@ def train_net(data, args, save_dir):
         epoch_stats = {}
         # Get valid loss for initializer
         initializer_net.eval()
-        policy_net.eval()
+        diffusion_net.eval()
         for Xvalid in valid_loader:
             Xvalid = Xvalid[0].to(DEVICE)
-            eval_net(data, Xvalid, initializer_net, args, 'valid', epoch_stats, policy_net, rl_enabled)
+            eval_net(data, Xvalid, initializer_net, args, 'valid', epoch_stats, diffusion_net, rl_enabled)
         # Get test loss for initializer
         for Xtest in test_loader:
             Xtest = Xtest[0].to(DEVICE)
-            eval_net(data, Xtest, initializer_net, args, 'test', epoch_stats, policy_net, rl_enabled)
+            eval_net(data, Xtest, initializer_net, args, 'test', epoch_stats, diffusion_net, rl_enabled)
         # Check if initial model is good enough (based on constraint violations from current evaluation)
         if not initial_model_good and 'valid_initial_ineq_num_viol_0' in epoch_stats:
             # Consider model good if constraint violations are below threshold
@@ -232,7 +230,6 @@ def train_net(data, args, save_dir):
         
         # Training loop - only train initializer if model is not good enough yet
         initializer_net.train()
-        policy_net.train()
         if not initial_model_good:
             for Xtrain, Ytrain in train_loader:
                 Xtrain = Xtrain.to(DEVICE)
@@ -265,122 +262,51 @@ def train_net(data, args, save_dir):
         
         # RL training step (if enabled)
         if rl_enabled:
-            # Get current BC/QL schedule
-            schedule = compute_bc_ql_schedule(i, args)
-            current_alpha = schedule['alpha']
-            current_beta = schedule['beta']
-            
-            # Step 1: Generate successful trajectories
+            alpha = args['alpha']
             initializer_net.eval()
-            policy_net.eval()
-            
+            diffusion_net.train()  # Set back to train mode
+            x_noisy_list = []
             for Xtrain, Ytrain in train_loader:
                 Xtrain = Xtrain.to(DEVICE)
                 Ytrain = Ytrain.to(DEVICE)
+                start_time = time.time()
+                # Step 1: Train diffusion network (supervised learning)
+                diffusion_opt.zero_grad()
+                bc_loss, x_noisy = diffusion_net.loss(Ytrain, Xtrain)
                 
-                with torch.no_grad():
-                    Y_init = initializer_net(Xtrain)  # Get initial Y from initializer
-                    Y_target = Ytrain  # Get target Y from dataset
-                    
-                # Generate trajectory data
-                states, actions = trajectory_sampler(Y_init, Y_target, data, Xtrain, args)
-                # Add to buffer and update buffer length
-                new_data = list(zip(states.cpu().numpy(), actions.cpu().numpy()))
-                buffer.extend(new_data)
-                current_buffer_size = len(buffer)
-                # Manage buffer size based on strategy
-                if current_buffer_size > buffer_size_limit:
-                    excess = current_buffer_size - buffer_size_limit
-                    if args.get('bufferStrategy', 'fifo') == 'fifo':
-                        # FIFO strategy: remove oldest data
-                        buffer = buffer[excess:]
-                        # print(f"Buffer FIFO cleaned: {current_buffer_size} -> {len(buffer)}")
-                    else:  # random strategy
-                        # Random strategy: keep random subset
-                        indices_to_keep = np.random.choice(current_buffer_size, buffer_size_limit, replace=False)
-                        indices_to_keep = np.sort(indices_to_keep)  # Sort for efficient indexing
-                        # Create new buffer and explicitly delete old one
-                        old_buffer = buffer
-                        buffer = [old_buffer[i] for i in indices_to_keep]
-                        # del old_buffer  # Explicitly delete old buffer
-                        # Force garbage collection to free memory
-                        import gc
-                        gc.collect()
-                        # print(f"Buffer random cleaned: {current_buffer_size} -> {len(buffer)}")
-
-                # # Generate on-policy trajectory data using current policy
-                # on_policy_states, on_policy_actions = on_policy_trajectory_collector(Y_init, policy_net, data, Xtrain, args)
-                # # Add to on-policy buffer
-                # new_on_policy_data = list(zip(on_policy_states.cpu().numpy(), on_policy_actions.cpu().numpy()))
-                # on_policy_buffer.extend(new_on_policy_data)
-                # current_on_policy_buffer_size = len(on_policy_buffer)
-                # # Manage on-policy buffer size based on strategy
-                # if current_on_policy_buffer_size > on_policy_buffer_size_limit:
-                #     excess = current_on_policy_buffer_size - on_policy_buffer_size_limit
-                #     if args.get('bufferStrategy', 'fifo') == 'fifo':
-                #         # FIFO strategy: remove oldest data
-                #         on_policy_buffer = on_policy_buffer[excess:]
-                #     else:  # random strategy
-                #         # Random strategy: keep random subset
-                #         indices_to_keep = np.random.choice(current_on_policy_buffer_size, on_policy_buffer_size_limit, replace=False)
-                #         indices_to_keep = np.sort(indices_to_keep)
-                #         # Create new buffer and explicitly delete old one
-                #         old_on_policy_buffer = on_policy_buffer
-                #         on_policy_buffer = [old_on_policy_buffer[i] for i in indices_to_keep]
-                #         # Force garbage collection to free memory
-                #         import gc
-                #         gc.collect()
+                # Collect x_noisy for statistics
+                x_noisy_list.append(x_noisy.detach().cpu())
+                
+                Yhat_init = initializer_net(Xtrain)
+                Yhat = diffusion_net.sample(Xtrain, Yhat_init)
+                ql_loss = loss_w_soft_penalty(data, Xtrain, Yhat, args)
+                total_loss = bc_loss + alpha * ql_loss
+                total_loss.sum().backward()
+                diffusion_opt.step()
+                train_time = time.time() - start_time
+                # Record statistics
+                dict_agg(epoch_stats, 'diffusion_total_loss', total_loss.detach().cpu().numpy())
+                dict_agg(epoch_stats, 'diffusion_bc_loss', [bc_loss.detach().cpu().numpy()])
+                dict_agg(epoch_stats, 'diffusion_ql_loss', ql_loss.detach().cpu().numpy())
+                dict_agg(epoch_stats, 'diffusion_train_time', train_time, op='sum')
             
-            policy_net.train()  # Set back to train mode
-            # Step 2: Train policy network (BC-RL)
-            policy_losses = []
-            current_buffer_size = len(buffer)
-            current_on_policy_buffer_size = len(on_policy_buffer)
-            # Determine batch composition based on on_policy_ratio
-            on_policy_batch_size = int(batch_size * on_policy_ratio) 
-            off_policy_batch_size = batch_size - on_policy_batch_size
-            for _ in range(args['policySteps']):
-                # Sample from off-policy buffer
-                off_policy_indices = np.random.choice(current_buffer_size, min(off_policy_batch_size, current_buffer_size), replace=False)
-                off_policy_batch_data = [buffer[i] for i in off_policy_indices]
-                # Sample from on-policy buffer
-                on_policy_indices = np.random.choice(current_on_policy_buffer_size, min(on_policy_batch_size, current_on_policy_buffer_size), replace=False)
-                on_policy_batch_data = [on_policy_buffer[i] for i in on_policy_indices]
-                # Combine batches
-                batch_data = off_policy_batch_data + on_policy_batch_data
-                # Convert to numpy arrays first, then to tensors (avoids slow list conversion)
-                batch_states_np = np.array([item[0] for item in batch_data])
-                batch_actions_np = np.array([item[1] for item in batch_data])
-                batch_states = torch.tensor(batch_states_np, device=DEVICE)
-                batch_actions = torch.tensor(batch_actions_np, device=DEVICE)
-                    
-                # Multiple policy update steps
-                loss_info = train_policy_step(
-                    policy_net, data, batch_states, batch_actions, args, policy_opt,
-                    alpha=current_alpha, beta=current_beta, lambda_temp=args['lambda_temp']
-                    )
-                policy_losses.append(loss_info)
-                    
-                # Clean up intermediate variables
-                # del batch_data, batch_states_np, batch_actions_np, batch_states, batch_actions, indices
-                
-            # Record policy training statistics (average if trained, zeros if not)
-            dict_agg(epoch_stats, 'policy_total_loss', [np.mean([info['total_loss'] for info in policy_losses])])
-            dict_agg(epoch_stats, 'policy_bc_loss', [np.mean([info['bc_loss'] for info in policy_losses])])
-            dict_agg(epoch_stats, 'policy_ql_loss', [np.mean([info['ql_loss'] for info in policy_losses])])
+            # Calculate and print x_noisy statistics for debugging
+            if x_noisy_list:
+                x_noisy_all = torch.cat(x_noisy_list, dim=0)
+                x_noisy_stats = calculate_x_noisy_stats(x_noisy_all)
+                print(f"Epoch {i} - X_noisy stats: mean={x_noisy_stats['mean']:.4f}, std={x_noisy_stats['std']:.4f}, range=[{x_noisy_stats['min']:.4f}, {x_noisy_stats['max']:.4f}], norm_mean={x_noisy_stats['norm_mean']:.4f}, norm_std={x_noisy_stats['norm_std']:.4f}, norm_range=[{x_noisy_stats['norm_min']:.4f}, {x_noisy_stats['norm_max']:.4f}]")
         
-            # Update log message with RL information
-            # Check if RL statistics exist before accessing them
-            if 'valid_eval' in epoch_stats and 'policy_total_loss' in epoch_stats:
-                improvement = np.mean(epoch_stats['valid_initial_eval']) - np.mean(epoch_stats['valid_eval'])
-                base_rl_msg = ' | After RL: eval {:.4f} (improvement: {:.4f}), dist {:.4f}, ineq max {:.4f}, ineq mean {:.4f}, ineq viol {:.1f}, eq max {:.4f}, policy loss {:.4f}'.format(
-                    np.mean(epoch_stats['valid_eval']), improvement, np.mean(epoch_stats['valid_dist']), 
-                    np.mean(epoch_stats['valid_ineq_max']), np.mean(epoch_stats['valid_ineq_mean']), np.mean(epoch_stats['valid_ineq_num_viol_0']), 
-                    np.mean(epoch_stats['valid_eq_max']), np.mean(epoch_stats['policy_total_loss']))
-                # Add schedule information
-                schedule_msg = ' | Schedule: {} (α={:.3f}, β={:.3f})'.format(
-                    schedule['phase'], schedule['alpha'], schedule['beta'])
-                log_msg += base_rl_msg + schedule_msg
+            # Update log message with diffusion training information
+            if 'diffusion_total_loss' in epoch_stats:
+                diffusion_msg = ' | Diffusion training: total loss {:.4f}, bc loss {:.4f}, ql loss {:.4f}'.format(
+                    np.mean(epoch_stats['diffusion_total_loss']), 
+                    np.mean(epoch_stats['diffusion_bc_loss']), 
+                    np.mean(epoch_stats['diffusion_ql_loss']))
+                log_msg += diffusion_msg
+            if 'valid_eval' in epoch_stats:
+                improved_msg = ' | Improved solution: eval {:.4f}, dist {:.4f}, ineq max {:.4f}, ineq mean {:.4f}, ineq num viol {:.4f}, eq max {:.4f}'.format(
+                    np.mean(epoch_stats['valid_eval']), np.mean(epoch_stats['valid_dist']), np.mean(epoch_stats['valid_ineq_max']), np.mean(epoch_stats['valid_ineq_mean']), np.mean(epoch_stats['valid_ineq_num_viol_0']), np.mean(epoch_stats['valid_eq_max']))
+                log_msg += improved_msg
         
         print(log_msg)
         
@@ -388,8 +314,7 @@ def train_net(data, args, save_dir):
         if PSUTIL_AVAILABLE:
             memory_gb = get_memory_usage()
             gpu_memory_gb = get_gpu_memory_usage()
-            buffer_info = f"Off-policy buffer: {len(buffer)}, On-policy buffer: {len(on_policy_buffer)}"
-            print(f"Epoch {i} - RAM: {memory_gb:.2f} GB, GPU: {gpu_memory_gb:.2f} GB, {buffer_info}")
+            print(f"Epoch {i} - RAM: {memory_gb:.2f} GB, GPU: {gpu_memory_gb:.2f} GB")
         # Clear PyTorch cache
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -410,15 +335,21 @@ def train_net(data, args, save_dir):
                 'valid_initial_eq_mean': np.mean(epoch_stats['valid_initial_eq_mean']),
                 'valid_initial_time': np.mean(epoch_stats['valid_initial_time']),
                 'train_time': np.mean(epoch_stats['train_time']),
-                'rl_enabled': float(rl_enabled),
-                'off_policy_buffer_size': len(buffer),
-                'on_policy_buffer_size': len(on_policy_buffer),
-                'on_policy_ratio': on_policy_ratio
+                'rl_enabled': float(rl_enabled)
             }
-            # Add RL-related metrics only when RL is enabled and statistics exist
-            if rl_enabled and 'valid_eval' in epoch_stats and 'policy_total_loss' in epoch_stats:
-                rl_metrics = {
-                    'valid_time': np.mean(epoch_stats['valid_time']),
+            # Add diffusion-related metrics only when RL is enabled and statistics exist
+            if rl_enabled and 'diffusion_total_loss' in epoch_stats:
+                diffusion_metrics = {
+                    'diffusion_total_loss': np.mean(epoch_stats['diffusion_total_loss']),
+                    'diffusion_bc_loss': np.mean(epoch_stats['diffusion_bc_loss']),
+                    'diffusion_ql_loss': np.mean(epoch_stats['diffusion_ql_loss']),
+                    'diffusion_train_time': np.mean(epoch_stats['diffusion_train_time'])
+                }
+                wandb_log_dict.update(diffusion_metrics)
+            
+            # Add improved solution metrics when diffusion is applied
+            if rl_enabled and 'valid_eval' in epoch_stats:
+                improved_metrics = {
                     'valid_eval': np.mean(epoch_stats['valid_eval']),
                     'valid_dist': np.mean(epoch_stats['valid_dist']),
                     'valid_ineq_max': np.mean(epoch_stats['valid_ineq_max']),
@@ -426,31 +357,10 @@ def train_net(data, args, save_dir):
                     'valid_ineq_num_viol_0': np.mean(epoch_stats['valid_ineq_num_viol_0']),
                     'valid_eq_max': np.mean(epoch_stats['valid_eq_max']),
                     'valid_eq_mean': np.mean(epoch_stats['valid_eq_mean']),
-                    'policy_total_loss': np.mean(epoch_stats['policy_total_loss']),
-                    'policy_bc_loss': np.mean(epoch_stats['policy_bc_loss']),
-                    'policy_ql_loss': np.mean(epoch_stats['policy_ql_loss']),
-                    'rl_improvement': np.mean(epoch_stats['valid_initial_eval']) - np.mean(epoch_stats['valid_eval'])
+                    'valid_time': np.mean(epoch_stats['valid_time']),
+                    'improvement': np.mean(epoch_stats['valid_initial_eval']) - np.mean(epoch_stats['valid_eval'])
                 }
-                
-                # Add schedule information
-                # schedule = compute_bc_ql_schedule(i, args)
-                schedule_phase_map = {
-                    'Pure BC': 0,
-                    'Final BC+QL': 2,
-                    'Fixed': 3
-                }
-                # Handle transition phase (contains "Transition" in name)
-                if 'Transition' in schedule['phase']:
-                    schedule_phase_num = 1
-                else:
-                    schedule_phase_num = schedule_phase_map.get(schedule['phase'], 3)
-                rl_metrics.update({
-                    'schedule_alpha': schedule['alpha'],
-                    'schedule_beta': schedule['beta'],
-                    'schedule_phase': schedule_phase_num,
-                    'schedule_progress': schedule['progress']
-                })
-                wandb_log_dict.update(rl_metrics)
+                wandb_log_dict.update(improved_metrics)
             
             wandb.log(wandb_log_dict)
 
@@ -479,22 +389,22 @@ def train_net(data, args, save_dir):
                 pickle.dump(stats, f)
             with open(os.path.join(save_dir, 'initializer_net.dict'), 'wb') as f:
                 torch.save(initializer_net.state_dict(), f)
-            with open(os.path.join(save_dir, 'policy_net.dict'), 'wb') as f:
-                torch.save(policy_net.state_dict(), f)
+            with open(os.path.join(save_dir, 'diffusion_net.dict'), 'wb') as f:
+                torch.save(diffusion_net.state_dict(), f)
 
     with open(os.path.join(save_dir, 'stats.dict'), 'wb') as f:
         pickle.dump(stats, f)
     with open(os.path.join(save_dir, 'initializer_net.dict'), 'wb') as f:
         torch.save(initializer_net.state_dict(), f)
-    with open(os.path.join(save_dir, 'policy_net.dict'), 'wb') as f:
-        torch.save(policy_net.state_dict(), f)
+    with open(os.path.join(save_dir, 'diffusion_net.dict'), 'wb') as f:
+        torch.save(diffusion_net.state_dict(), f)
     
     # Finish wandb run
     if args.get('useWandb', False) and WANDB_AVAILABLE:
         wandb.finish()
         print("Wandb run finished")
     
-    return initializer_net, policy_net, stats
+    return initializer_net, diffusion_net, stats
 
 # Modifies stats in place
 def dict_agg(stats, key, value, op='concat'):
@@ -509,7 +419,7 @@ def dict_agg(stats, key, value, op='concat'):
         stats[key] = value
 
 # Modifies stats in place
-def eval_net(data, X, solver_net, args, prefix, stats, policy_net=None, rl_enabled=False):
+def eval_net(data, X, solver_net, args, prefix, stats, diffusion_net=None, rl_enabled=False):
     eps_converge = args['corrEps']
     make_prefix = lambda x: "{}_{}".format(prefix, x)
 
@@ -544,50 +454,40 @@ def eval_net(data, X, solver_net, args, prefix, stats, policy_net=None, rl_enabl
     dict_agg(stats, make_prefix('initial_eq_num_viol_2'),
              torch.sum(torch.abs(data.eq_resid(X, Y_initial)) > 100 * eps_converge, dim=1).detach().cpu().numpy())
 
-    # Check if RL training has started and apply policy to improve solution
-    if policy_net is not None and rl_enabled:
+    # Check if RL training has started and apply diffusion to improve solution
+    if diffusion_net is not None and rl_enabled:
         start_time = time.time()
-        # Apply policy to improve the solution
-        Y_current = Y_initial.clone()
-        for step in range(args['episodeLength']):
-            with torch.no_grad():
-                # Create state by concatenating X and Y_current
-                state = torch.cat([X, Y_current], dim=1)
-                # Sample partial action from policy
-                partial_action = policy_net.sample_action(state)
-                # Apply action to update Y using policy's state_transition
-                Y_current = policy_net.state_transition(X, Y_current, partial_action)
-        Y = Y_current  # Use the improved Y from policy steps
+        # Apply diffusion to improve the solution
+        Y_improved = diffusion_net.sample(X, Y_initial)
         end_time = time.time()
 
-        # Record final solution metrics (after RL if applicable)
+        # Record final solution metrics (after diffusion if applicable)
         dict_agg(stats, make_prefix('time'), end_time - start_time, op='sum')
-        dict_agg(stats, make_prefix('steps'), args['episodeLength'])
-        dict_agg(stats, make_prefix('loss'), loss_w_soft_penalty(data, X, Y, args).detach().cpu().numpy())
+        dict_agg(stats, make_prefix('loss'), loss_w_soft_penalty(data, X, Y_improved, args).detach().cpu().numpy())
         if hasattr(data, 'data_all'):
             # This is a SimpleProblemMultiParam dataset
-            dict_agg(stats, make_prefix('eval'), data.obj_fn(Y, X).detach().cpu().numpy())
+            dict_agg(stats, make_prefix('eval'), data.obj_fn(Y_improved, X).detach().cpu().numpy())
         else:
             # This is a regular SimpleProblem dataset
-            dict_agg(stats, make_prefix('eval'), data.obj_fn(Y).detach().cpu().numpy())
-        dict_agg(stats, make_prefix('dist'), torch.norm(Y - Y_initial, dim=1).detach().cpu().numpy())  # Distance from initial to final
-        dict_agg(stats, make_prefix('ineq_max'), torch.max(data.ineq_dist(X, Y), dim=1)[0].detach().cpu().numpy())
-        dict_agg(stats, make_prefix('ineq_mean'), torch.mean(data.ineq_dist(X, Y), dim=1).detach().cpu().numpy())
+            dict_agg(stats, make_prefix('eval'), data.obj_fn(Y_improved).detach().cpu().numpy())
+        dict_agg(stats, make_prefix('dist'), torch.norm(Y_improved - Y_initial, dim=1).detach().cpu().numpy())  # Distance from initial to final
+        dict_agg(stats, make_prefix('ineq_max'), torch.max(data.ineq_dist(X, Y_improved), dim=1)[0].detach().cpu().numpy())
+        dict_agg(stats, make_prefix('ineq_mean'), torch.mean(data.ineq_dist(X, Y_improved), dim=1).detach().cpu().numpy())
         dict_agg(stats, make_prefix('ineq_num_viol_0'),
-                 torch.sum(data.ineq_dist(X, Y) > eps_converge, dim=1).detach().cpu().numpy())
+                 torch.sum(data.ineq_dist(X, Y_improved) > eps_converge, dim=1).detach().cpu().numpy())
         dict_agg(stats, make_prefix('ineq_num_viol_1'),
-                 torch.sum(data.ineq_dist(X, Y) > 10 * eps_converge, dim=1).detach().cpu().numpy())
+                 torch.sum(data.ineq_dist(X, Y_improved) > 10 * eps_converge, dim=1).detach().cpu().numpy())
         dict_agg(stats, make_prefix('ineq_num_viol_2'),
-                 torch.sum(data.ineq_dist(X, Y) > 100 * eps_converge, dim=1).detach().cpu().numpy())
+                 torch.sum(data.ineq_dist(X, Y_improved) > 100 * eps_converge, dim=1).detach().cpu().numpy())
         dict_agg(stats, make_prefix('eq_max'),
-                 torch.max(torch.abs(data.eq_resid(X, Y)), dim=1)[0].detach().cpu().numpy())
-        dict_agg(stats, make_prefix('eq_mean'), torch.mean(torch.abs(data.eq_resid(X, Y)), dim=1).detach().cpu().numpy())
+                 torch.max(torch.abs(data.eq_resid(X, Y_improved)), dim=1)[0].detach().cpu().numpy())
+        dict_agg(stats, make_prefix('eq_mean'), torch.mean(torch.abs(data.eq_resid(X, Y_improved)), dim=1).detach().cpu().numpy())
         dict_agg(stats, make_prefix('eq_num_viol_0'),
-                 torch.sum(torch.abs(data.eq_resid(X, Y)) > eps_converge, dim=1).detach().cpu().numpy())
+                 torch.sum(torch.abs(data.eq_resid(X, Y_improved)) > eps_converge, dim=1).detach().cpu().numpy())
         dict_agg(stats, make_prefix('eq_num_viol_1'),
-                 torch.sum(torch.abs(data.eq_resid(X, Y)) > 10 * eps_converge, dim=1).detach().cpu().numpy())
+                 torch.sum(torch.abs(data.eq_resid(X, Y_improved)) > 10 * eps_converge, dim=1).detach().cpu().numpy())
         dict_agg(stats, make_prefix('eq_num_viol_2'),
-                 torch.sum(torch.abs(data.eq_resid(X, Y)) > 100 * eps_converge, dim=1).detach().cpu().numpy())
+                 torch.sum(torch.abs(data.eq_resid(X, Y_improved)) > 100 * eps_converge, dim=1).detach().cpu().numpy())
     return stats
 
 def loss_w_soft_penalty(data, X, Y, args):
@@ -636,6 +536,50 @@ class NNSolver(nn.Module):
             out_full = out
 
         return out_full
+
+
+def calculate_x_noisy_stats(x_noisy):
+    """
+    Calculate statistics for x_noisy tensor
+    Args:
+        x_noisy: tensor of shape (batch_size, action_dim)
+    Returns:
+        dict: statistics including mean, std, min, max, norm_mean, norm_std
+    """
+    import numpy as np
+    
+    # Convert to numpy for easier computation
+    x_noisy_np = x_noisy.numpy()
+    
+    # Basic statistics
+    mean_val = np.mean(x_noisy_np)
+    std_val = np.std(x_noisy_np)
+    min_val = np.min(x_noisy_np)
+    max_val = np.max(x_noisy_np)
+    
+    # Norm statistics (L2 norm for each sample)
+    norms = np.linalg.norm(x_noisy_np, axis=1)
+    norm_mean = np.mean(norms)
+    norm_std = np.std(norms)
+    norm_min = np.min(norms)
+    norm_max = np.max(norms)
+    
+    # Absolute value statistics
+    abs_mean = np.mean(np.abs(x_noisy_np))
+    abs_std = np.std(np.abs(x_noisy_np))
+    
+    return {
+        'mean': mean_val,
+        'std': std_val,
+        'min': min_val,
+        'max': max_val,
+        'norm_mean': norm_mean,
+        'norm_std': norm_std,
+        'norm_min': norm_min,
+        'norm_max': norm_max,
+        'abs_mean': abs_mean,
+        'abs_std': abs_std
+    }
 
 
 if __name__=='__main__':

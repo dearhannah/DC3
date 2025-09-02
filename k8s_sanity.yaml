@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: data-checker-by-steps-2
+  name: sanity-diffusion-bc-betas-n5
 spec:
   restartPolicy: Never 
   securityContext:
@@ -25,8 +25,15 @@ spec:
           cd /workspace/research/DC3
           echo "Running from $(pwd)"
           #python
-          # python method_5.py --useSanity=True --useWandb=True --useCompl=True --alpha=1.0 --beta=0.0
-          python data_checker.py --useSanity=True --useWandb=True --useCompl=True --alpha=0.0 --beta=1.0
+          python method_6.py --useSanity=True --useWandb=True --useCompl=True --diffusion_beta_start=0.01 --diffusion_beta_end=0.20 --n_timesteps=5
+          python method_6.py --useSanity=True --useWandb=True --useCompl=True --diffusion_beta_start=0.01 --diffusion_beta_end=0.30 --n_timesteps=5
+          python method_6.py --useSanity=True --useWandb=True --useCompl=True --diffusion_beta_start=0.01 --diffusion_beta_end=0.40 --n_timesteps=5
+          python method_6.py --useSanity=True --useWandb=True --useCompl=True --diffusion_beta_start=0.01 --diffusion_beta_end=0.50 --n_timesteps=5
+          python method_6.py --useSanity=True --useWandb=True --useCompl=True --diffusion_beta_start=0.05 --diffusion_beta_end=0.20 --n_timesteps=5
+          python method_6.py --useSanity=True --useWandb=True --useCompl=True --diffusion_beta_start=0.05 --diffusion_beta_end=0.30 --n_timesteps=5
+          python method_6.py --useSanity=True --useWandb=True --useCompl=True --diffusion_beta_start=0.05 --diffusion_beta_end=0.40 --n_timesteps=5
+          python method_6.py --useSanity=True --useWandb=True --useCompl=True --diffusion_beta_start=0.05 --diffusion_beta_end=0.50 --n_timesteps=5
+          # python data_checker.py --useSanity=True --useWandb=True --useCompl=True --alpha=0.0 --beta=1.0
       resources:
         limits:
           memory: "40Gi"

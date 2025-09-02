@@ -13,34 +13,37 @@ from agents.helpers import (cosine_beta_schedule,
                             vp_beta_schedule,
                             extract,
                             Losses)
-from utils.utils import Progress, Silent
+# from utils.utils import Progress, Silent
 
 
 class Diffusion(nn.Module):
-    def __init__(self, state_dim, action_dim, model, max_action,
-                 beta_schedule='linear', n_timesteps=100,
-                 loss_type='l2', clip_denoised=True, predict_epsilon=True):
+    def __init__(self, data, model, args):
         super(Diffusion, self).__init__()
 
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.max_action = max_action
+        self.state_dim = data.xdim + data.ydim
+        self.action_dim = data.ydim
+        self.action_partial_dim = data.ydim - data.neq
+        self.max_noise = args['max_noise']
         self.model = model
+        self.data = data
 
+        self.n_timesteps = int(args.get('n_timesteps', 5))
+        self.clip_denoised = args.get('clip_denoised', False)
+        self.predict_epsilon = args.get('predict_epsilon', True)
+
+        beta_schedule = args.get('beta_schedule', 'linear')
         if beta_schedule == 'linear':
-            betas = linear_beta_schedule(n_timesteps)
+            betas = linear_beta_schedule(self.n_timesteps, args['diffusion_beta_start'], args['diffusion_beta_end'])
         elif beta_schedule == 'cosine':
-            betas = cosine_beta_schedule(n_timesteps)
+            betas = cosine_beta_schedule(self.n_timesteps)
         elif beta_schedule == 'vp':
-            betas = vp_beta_schedule(n_timesteps)
+            betas = vp_beta_schedule(self.n_timesteps)
+        else:
+            raise ValueError(f"Unknown beta_schedule: {beta_schedule}. Must be one of ['linear', 'cosine', 'vp']")
 
         alphas = 1. - betas
         alphas_cumprod = torch.cumprod(alphas, axis=0)
         alphas_cumprod_prev = torch.cat([torch.ones(1), alphas_cumprod[:-1]])
-
-        self.n_timesteps = int(n_timesteps)
-        self.clip_denoised = clip_denoised
-        self.predict_epsilon = predict_epsilon
 
         self.register_buffer('betas', betas)
         self.register_buffer('alphas_cumprod', alphas_cumprod)
@@ -66,7 +69,7 @@ class Diffusion(nn.Module):
         self.register_buffer('posterior_mean_coef2',
                              (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod))
 
-        self.loss_fn = Losses[loss_type]()
+        self.loss_fn = Losses[args.get('loss_type', 'l2')]()
 
     # ------------------------------------------ sampling ------------------------------------------#
 
@@ -94,12 +97,6 @@ class Diffusion(nn.Module):
 
     def p_mean_variance(self, x, t, s):
         x_recon = self.predict_start_from_noise(x, t=t, noise=self.model(x, t, s))
-
-        if self.clip_denoised:
-            x_recon.clamp_(-self.max_action, self.max_action)
-        else:
-            assert RuntimeError()
-
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance
 
@@ -107,71 +104,56 @@ class Diffusion(nn.Module):
     def p_sample(self, x, t, s):
         b, *_, device = *x.shape, x.device
         model_mean, _, model_log_variance = self.p_mean_variance(x=x, t=t, s=s)
-        noise = torch.randn_like(x)
+        noise = torch.randn_like(x).clamp(-self.max_noise, self.max_noise)
         # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
     # @torch.no_grad()
-    def p_sample_loop(self, state, shape, verbose=False, return_diffusion=False):
+    def p_sample_loop(self, state, x_init=None, shape=None, verbose=False, return_diffusion=False):
         device = self.betas.device
-
-        batch_size = shape[0]
-        x = torch.randn(shape, device=device)
-
+        batch_size = x_init.shape[0]
+        x = x_init.to(device)
         if return_diffusion: diffusion = [x]
-
-        progress = Progress(self.n_timesteps) if verbose else Silent()
         for i in reversed(range(0, self.n_timesteps)):
             timesteps = torch.full((batch_size,), i, device=device, dtype=torch.long)
             x = self.p_sample(x, timesteps, state)
-
-            progress.update({'t': i})
-
             if return_diffusion: diffusion.append(x)
-
-        progress.close()
-
         if return_diffusion:
             return x, torch.stack(diffusion, dim=1)
         else:
             return x
 
     # @torch.no_grad()
-    def sample(self, state, *args, **kwargs):
-        batch_size = state.shape[0]
-        shape = (batch_size, self.action_dim)
-        action = self.p_sample_loop(state, shape, *args, **kwargs)
-        return action.clamp_(-self.max_action, self.max_action)
+    def sample(self, state, action_init=None, shape=None, *args, **kwargs):
+        if action_init is None:
+            batch_size = state.shape[0]
+            shape = (batch_size, self.action_dim)
+        action = self.p_sample_loop(state, action_init, shape, *args, **kwargs)
+        action = self.data.complete_partial_parallel(state, action[:, :self.action_partial_dim])
+        return action#.clamp_(-self.max_action, self.max_action)
 
     # ------------------------------------------ training ------------------------------------------#
 
     def q_sample(self, x_start, t, noise=None):
         if noise is None:
-            noise = torch.randn_like(x_start)
-
+            noise = torch.randn_like(x_start).clamp(-self.max_noise, self.max_noise)
         sample = (
                 extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
                 extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
-
         return sample
 
     def p_losses(self, x_start, state, t, weights=1.0):
-        noise = torch.randn_like(x_start)
-
+        noise = torch.randn_like(x_start).clamp(-self.max_noise, self.max_noise)
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-
         x_recon = self.model(x_noisy, t, state)
-
         assert noise.shape == x_recon.shape
-
         if self.predict_epsilon:
             loss = self.loss_fn(x_recon, noise, weights)
         else:
             loss = self.loss_fn(x_recon, x_start, weights)
-
-        return loss
+        return loss, x_noisy
 
     def loss(self, x, state, weights=1.0):
         batch_size = len(x)
